@@ -114,9 +114,17 @@ impl INode for DesktopCaster {
                 false,
                 Format::RGBA8,
             ) {
-                if let Some(texture) = ImageTexture::create_from_image(&image) {
-                    self.image = Some(image);
-                    self.texture = Some(texture);
+                self.image = Some(image.clone());
+                // Resize the existing ImageTexture in place instead of
+                // replacing it. Consumers hold a reference to the same texture
+                // object returned by `get_texture()`, and `update()` cannot
+                // change its dimensions, so `set_image()` (which recreates the
+                // underlying RID and emits `changed`) keeps their reference
+                // valid across resizes.
+                if let Some(texture) = &mut self.texture {
+                    texture.set_image(&image);
+                } else {
+                    self.texture = ImageTexture::create_from_image(&image);
                 }
             }
             self.frame_ready.store(false, Ordering::Release);
