@@ -130,15 +130,16 @@ fn convert_to_rgba(
 }
 
 pub struct PipeWireCaptureBackend {
-    rx: mpsc::Receiver<Vec<u8>>,
+    rx: mpsc::Receiver<(u32, u32, Vec<u8>)>,
     pw_thread: Option<std::thread::JoinHandle<()>>,
     quit_sender: Option<pipewire::channel::Sender<()>>,
-    width: u32,
-    height: u32,
+    /// Frame dimensions that differ from the Godot-side buffers. Drained by
+    /// the capture worker, which asks Godot to reallocate before continuing.
+    size_change: Option<(u32, u32)>,
 }
 
 impl CaptureBackend for PipeWireCaptureBackend {
-    fn init(width: u32, height: u32) -> Result<Self, String> {
+    fn init(_width: u32, _height: u32) -> Result<Self, String> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -166,7 +167,7 @@ impl CaptureBackend for PipeWireCaptureBackend {
             })
             .map_err(|e| format!("XDG Portal error: {e}"))?;
 
-        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(1);
+        let (tx, rx) = mpsc::sync_channel::<(u32, u32, Vec<u8>)>(1);
         let (quit_sender, quit_receiver) = pipewire::channel::channel::<()>();
         let (startup_tx, startup_rx) = mpsc::channel::<WorkerStartup>();
 
@@ -258,15 +259,15 @@ impl CaptureBackend for PipeWireCaptureBackend {
                                         (chunk.size(), chunk.offset(), chunk.stride())
                                     };
                                     if let Some(map) = data.data() {
-                                        if let Some(frame) = convert_to_rgba(
-                                            map,
-                                            chunk_size,
-                                            chunk_offset,
-                                            chunk_stride,
-                                            negotiated,
-                                        ) {
-                                            let _ = tx.try_send(frame);
-                                        }
+                                            if let Some(frame) = convert_to_rgba(
+                                                map,
+                                                chunk_size,
+                                                chunk_offset,
+                                                chunk_stride,
+                                                negotiated,
+                                            ) {
+                                                let _ = tx.try_send((negotiated.width, negotiated.height, frame));
+                                            }
                                     }
                                 }
                                 // pipewire 0.9+: Buffer auto-queues back on Drop.
@@ -333,23 +334,11 @@ impl CaptureBackend for PipeWireCaptureBackend {
             rx,
             pw_thread: Some(pw_thread),
             quit_sender: Some(quit_sender),
-            width,
-            height,
+            size_change: None,
         })
     }
 
     fn capture_frame(&mut self, buffer: &mut [u8], timeout_ms: u32) -> Result<bool, CaptureError> {
-        let expected_len = (self.width as usize)
-            .checked_mul(self.height as usize)
-            .and_then(|pixels| pixels.checked_mul(4))
-            .ok_or_else(|| CaptureError::Fatal("Capture dimensions overflow usize".to_owned()))?;
-        if buffer.len() != expected_len {
-            return Err(CaptureError::Fatal(format!(
-                "Capture buffer has {} bytes; expected {expected_len}",
-                buffer.len()
-            )));
-        }
-
         let result = if timeout_ms == 0 {
             self.rx.try_recv().map_err(|e| match e {
                 mpsc::TryRecvError::Empty => CaptureError::Recoverable("No frame".into()),
@@ -369,12 +358,24 @@ impl CaptureBackend for PipeWireCaptureBackend {
         };
 
         match result {
-            Ok(frame) => {
+            Ok((frame_width, frame_height, frame)) => {
+                let expected_len = (frame_width as usize)
+                    .checked_mul(frame_height as usize)
+                    .and_then(|pixels| pixels.checked_mul(4))
+                    .ok_or_else(|| {
+                        CaptureError::Fatal("Capture dimensions overflow usize".to_owned())
+                    })?;
                 if frame.len() != expected_len {
                     return Err(CaptureError::Reinitialize(format!(
                         "PipeWire frame has {} bytes; expected {expected_len}",
                         frame.len()
                     )));
+                }
+                if buffer.len() != expected_len {
+                    // Godot-side buffers are stale; drop the frame and let the
+                    // capture worker ask Godot to reallocate.
+                    self.size_change = Some((frame_width, frame_height));
+                    return Ok(false);
                 }
                 buffer.copy_from_slice(&frame);
                 Ok(true)
@@ -396,6 +397,12 @@ impl CaptureBackend for PipeWireCaptureBackend {
                 );
             }
         }
+    }
+}
+
+impl PipeWireCaptureBackend {
+    pub(crate) fn take_size_change(&mut self) -> Option<(u32, u32)> {
+        self.size_change.take()
     }
 }
 

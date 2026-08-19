@@ -85,6 +85,45 @@ impl INode for DesktopCaster {
             godot_error!("{error}");
         }
 
+        // The capture worker may deliver frames at a different size than the
+        // primary display (window capture, scaled monitors). Reallocate the
+        // buffers and image/texture before consuming any new frame.
+        if let Some((new_width, new_height)) = self.control.take_pending_size() {
+            let new_len = (new_width as usize)
+                .saturating_mul(new_height as usize)
+                .saturating_mul(4);
+            {
+                let mut front = self
+                    .front_buffer
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                front.resize(new_len, 0);
+            }
+            {
+                let mut back = self
+                    .back_buffer
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                back.resize(new_len, 0);
+            }
+            self.width = new_width;
+            self.height = new_height;
+            if let Some(image) = Image::create_empty(
+                new_width as i32,
+                new_height as i32,
+                false,
+                Format::RGBA8,
+            ) {
+                if let Some(texture) = ImageTexture::create_from_image(&image) {
+                    self.image = Some(image);
+                    self.texture = Some(texture);
+                }
+            }
+            self.frame_ready.store(false, Ordering::Release);
+            self.control.notify();
+            return;
+        }
+
         if !self.frame_ready.load(Ordering::Acquire) {
             return;
         }

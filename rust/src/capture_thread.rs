@@ -26,6 +26,10 @@ pub struct CaptureControl {
     wake: Condvar,
     last_error: Mutex<String>,
     pending_error: Mutex<Option<String>>,
+    /// Frame dimensions the worker needs Godot to reallocate to. Godot takes
+    /// it (acknowledging the resize) from `process`; the worker waits while it
+    /// is set.
+    pending_size: Mutex<Option<(u32, u32)>>,
 }
 
 impl CaptureControl {
@@ -37,6 +41,7 @@ impl CaptureControl {
             wake: Condvar::new(),
             last_error: Mutex::new(String::new()),
             pending_error: Mutex::new(None),
+            pending_size: Mutex::new(None),
         }
     }
 
@@ -95,6 +100,28 @@ impl CaptureControl {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
+    }
+
+    pub fn set_pending_size(&self, size: (u32, u32)) {
+        *self
+            .pending_size
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(size);
+        self.notify();
+    }
+
+    pub fn take_pending_size(&self) -> Option<(u32, u32)> {
+        self.pending_size
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    pub fn has_pending_size(&self) -> bool {
+        self.pending_size
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
     }
 
     pub fn notify(&self) {
@@ -160,8 +187,8 @@ impl CaptureThread {
     }
 
     fn run(
-        width: u32,
-        height: u32,
+        mut width: u32,
+        mut height: u32,
         back_buffer: Arc<Mutex<Vec<u8>>>,
         frame_ready: Arc<AtomicBool>,
         is_running: Arc<AtomicBool>,
@@ -185,12 +212,34 @@ impl CaptureThread {
 
         // Lazily allocated scratch buffer for Vsync mode to avoid holding the
         // back_buffer lock during OS waits.
-        let buf_size = (width as usize)
+        let mut buf_size = (width as usize)
             .saturating_mul(height as usize)
             .saturating_mul(4);
         let mut vsync_scratch: Vec<u8> = Vec::new();
 
         while is_running.load(Ordering::Acquire) {
+            // The backend may deliver frames at a different size than the
+            // buffers were allocated with (window capture, scaled monitors).
+            // Pause capturing and let Godot reallocate before continuing.
+            if let Some((new_width, new_height)) = backend.take_size_change() {
+                if (new_width, new_height) != (width, height) {
+                    control.set_pending_size((new_width, new_height));
+                    while control.has_pending_size() && is_running.load(Ordering::Acquire) {
+                        control.wait(FRAME_CONSUMED_POLL);
+                    }
+                    if !is_running.load(Ordering::Acquire) {
+                        break;
+                    }
+                    width = new_width;
+                    height = new_height;
+                    buf_size = (width as usize)
+                        .saturating_mul(height as usize)
+                        .saturating_mul(4);
+                    vsync_scratch.clear();
+                    continue;
+                }
+            }
+
             // Keep only the latest frame. Capturing while Godot still owns a
             // complete frame wastes GPU readback and increases latency.
             if frame_ready.load(Ordering::Acquire) {
