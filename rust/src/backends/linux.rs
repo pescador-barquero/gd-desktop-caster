@@ -44,6 +44,13 @@ impl CaptureBackend for LinuxCaptureBackend {
         }
     }
 
+    fn take_size_change(&mut self) -> Option<(u32, u32)> {
+        match self {
+            Self::PipeWire(pw) => pw.take_size_change(),
+            Self::X11(x11) => x11.take_size_change(),
+        }
+    }
+
     fn destroy(&mut self) {
         match self {
             Self::PipeWire(pw) => pw.destroy(),
@@ -51,5 +58,3 @@ impl CaptureBackend for LinuxCaptureBackend {
         }
     }
 }
-
-pub type PlatformBackend = LinuxCaptureBackend;
