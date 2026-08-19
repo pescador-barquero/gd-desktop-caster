@@ -9,6 +9,10 @@ use pipewire::context::ContextRc;
 use pipewire::main_loop::MainLoopRc;
 // Explicitly import macro to avoid shadowing by the `pipewire::properties` module.
 use pipewire::properties::properties;
+use pipewire::spa::param::format::{MediaSubtype, MediaType};
+use pipewire::spa::param::format_utils;
+use pipewire::spa::param::video::{VideoFormat, VideoInfoRaw};
+use pipewire::spa::pod::Pod;
 use pipewire::spa::utils::Direction;
 use pipewire::stream::{StreamFlags, StreamRc};
 
@@ -16,6 +20,113 @@ use pipewire::stream::{StreamFlags, StreamRc};
 enum WorkerStartup {
     Ready,
     Failed(String),
+}
+
+/// The stream format as negotiated with the compositor.
+#[derive(Clone, Copy)]
+struct NegotiatedFormat {
+    spa_format: u32,
+    width: u32,
+    height: u32,
+}
+
+/// Listener state shared by the PipeWire event callbacks (same thread).
+struct ListenerState {
+    negotiated: Option<NegotiatedFormat>,
+}
+
+/// Build a SPA EnumFormat pod requesting raw video in the common 4-byte
+/// formats, letting the compositor pick its native size.
+fn build_raw_format_params() -> Result<Vec<u8>, String> {
+    let obj = pipewire::spa::pod::object!(
+        pipewire::spa::utils::SpaTypes::ObjectParamFormat,
+        pipewire::spa::param::ParamType::EnumFormat,
+        pipewire::spa::pod::property!(
+            pipewire::spa::param::format::FormatProperties::MediaType,
+            Id,
+            MediaType::Video
+        ),
+        pipewire::spa::pod::property!(
+            pipewire::spa::param::format::FormatProperties::MediaSubtype,
+            Id,
+            MediaSubtype::Raw
+        ),
+        pipewire::spa::pod::property!(
+            pipewire::spa::param::format::FormatProperties::VideoFormat,
+            Choice,
+            Enum,
+            Id,
+            VideoFormat::BGRx,
+            VideoFormat::BGRx,
+            VideoFormat::BGRA,
+            VideoFormat::RGBx,
+            VideoFormat::RGBA
+        ),
+    );
+    pipewire::spa::pod::serialize::PodSerializer::serialize(
+        std::io::Cursor::new(Vec::new()),
+        &pipewire::spa::pod::Value::Object(obj),
+    )
+    .map(|(cursor, _)| cursor.into_inner())
+    .map_err(|error| format!("Failed to serialize capture format params: {error:?}"))
+}
+
+/// Convert one scanline of `spa_format` pixels into tightly packed RGBA8.
+fn convert_row(src: &[u8], dst: &mut [u8], spa_format: u32) {
+    match spa_format {
+        // BGRx / BGRA: bytes are B, G, R, x|A.
+        format if format == VideoFormat::BGRx.as_raw() || format == VideoFormat::BGRA.as_raw() => {
+            for (out, input) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+                out[0] = input[2];
+                out[1] = input[1];
+                out[2] = input[0];
+                out[3] = 255;
+            }
+        }
+        // RGBx / RGBA: bytes are R, G, B, x|A.
+        format if format == VideoFormat::RGBx.as_raw() || format == VideoFormat::RGBA.as_raw() => {
+            for (out, input) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+                out[0] = input[0];
+                out[1] = input[1];
+                out[2] = input[2];
+                out[3] = 255;
+            }
+        }
+        // Unknown layout: copy verbatim so the frame is at least visible.
+        _ => dst.copy_from_slice(src),
+    }
+}
+
+/// Convert a mapped frame buffer into tightly packed RGBA8, honoring the
+/// per-row stride so padded rows are handled. `chunk_size` limits how much of
+/// the mapping is valid data.
+fn convert_to_rgba(
+    map: &[u8],
+    chunk_size: u32,
+    chunk_offset: u32,
+    chunk_stride: i32,
+    negotiated: NegotiatedFormat,
+) -> Option<Vec<u8>> {
+    let width = negotiated.width as usize;
+    let height = negotiated.height as usize;
+    let row_bytes = width.checked_mul(4)?;
+    let stride = if chunk_stride as usize >= row_bytes {
+        chunk_stride as usize
+    } else {
+        row_bytes
+    };
+    let offset = chunk_offset as usize;
+    let valid = (chunk_size as usize).min(map.len().saturating_sub(offset));
+    let rows = (valid / stride).min(height);
+
+    let mut out = vec![0u8; width.checked_mul(height)?.checked_mul(4)?];
+    for y in 0..rows {
+        let start = offset + y * stride;
+        let src_row = &map[start..start + row_bytes];
+        let dst_row = &mut out[y * row_bytes..(y + 1) * row_bytes];
+        convert_row(src_row, dst_row, negotiated.spa_format);
+    }
+    Some(out)
 }
 
 pub struct PipeWireCaptureBackend {
@@ -108,30 +219,53 @@ impl CaptureBackend for PipeWireCaptureBackend {
                     loop_clone.quit();
                 });
 
-                let buffer_size = (width * height * 4) as usize;
-
                 let _listener = try_setup!(
                     stream
-                        .add_local_listener_with_user_data(())
-                        .process(move |stream, _| {
+                        .add_local_listener_with_user_data(ListenerState { negotiated: None })
+                        .param_changed(move |_, state, id, param| {
+                            if id != pipewire::spa::param::ParamType::Format.as_raw() {
+                                return;
+                            }
+                            let Some(param) = param else { return };
+                            let Ok((media_type, media_subtype)) = format_utils::parse_format(param)
+                            else {
+                                return;
+                            };
+                            if media_type != MediaType::Video
+                                || media_subtype != MediaSubtype::Raw
+                            {
+                                return;
+                            }
+                            let mut raw = VideoInfoRaw::new();
+                            if raw.parse(param).is_err() {
+                                return;
+                            }
+                            state.negotiated = Some(NegotiatedFormat {
+                                spa_format: raw.format().as_raw(),
+                                width: raw.size().width,
+                                height: raw.size().height,
+                            });
+                        })
+                        .process(move |stream, state| {
+                            // Frames are only produced once a raw format has been
+                            // negotiated; without it there is nothing to read.
+                            let Some(negotiated) = state.negotiated else { return };
                             if let Some(mut buffer) = stream.dequeue_buffer() {
                                 let datas = buffer.datas_mut();
                                 if let Some(data) = datas.first_mut() {
-                                    // Renamed to `data()` in pipewire 0.9.
+                                    let (chunk_size, chunk_offset, chunk_stride) = {
+                                        let chunk = data.chunk();
+                                        (chunk.size(), chunk.offset(), chunk.stride())
+                                    };
                                     if let Some(map) = data.data() {
-                                        // Validate buffer size before processing.
-                                        if map.len() == buffer_size {
-                                            let mut out = vec![0u8; buffer_size];
-                                            for (d, s) in
-                                                out.chunks_exact_mut(4).zip(map.chunks_exact(4))
-                                            {
-                                                // Convert BGRx -> RGBA.
-                                                d[0] = s[2]; // R
-                                                d[1] = s[1]; // G
-                                                d[2] = s[0]; // B
-                                                d[3] = 255;  // A
-                                            }
-                                            let _ = tx.try_send(out);
+                                        if let Some(frame) = convert_to_rgba(
+                                            map,
+                                            chunk_size,
+                                            chunk_offset,
+                                            chunk_stride,
+                                            negotiated,
+                                        ) {
+                                            let _ = tx.try_send(frame);
                                         }
                                     }
                                 }
@@ -142,11 +276,25 @@ impl CaptureBackend for PipeWireCaptureBackend {
                     "Failed to register PipeWire stream listener"
                 );
 
+                // Request a raw (CPU-readable) format explicitly. Without a
+                // format param the portal node may pick a DMA-BUF format whose
+                // buffers cannot be mapped, silently producing no frames.
+                let params_bytes = match build_raw_format_params() {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        let _ = startup_tx.send(WorkerStartup::Failed(error));
+                        return;
+                    }
+                };
+                // The pod borrows from params_bytes; both live until connect
+                // returns and are then dropped together.
+                let mut params: Vec<&Pod> = vec![Pod::from_bytes(&params_bytes).unwrap()];
+
                 let connect_result = stream.connect(
                     Direction::Input,
                     Some(node_id),
                     StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS,
-                    &mut [],
+                    params.as_mut_slice(),
                 );
                 if let Err(error) = connect_result {
                     let _ = startup_tx.send(WorkerStartup::Failed(format!(
