@@ -55,6 +55,11 @@ pub struct DesktopCaster {
 
     width: u32,
     height: u32,
+    /// True once a real frame has been swapped into `front_buffer`. Distinct
+    /// from `frame_ready` (which is cleared immediately after each swap):
+    /// screenshots need to know the front buffer holds actual pixels rather
+    /// than the zeroed allocation from `start()` or a resize.
+    has_frame: bool,
 }
 
 #[godot_api]
@@ -74,6 +79,7 @@ impl INode for DesktopCaster {
             frame_ready: Arc::new(AtomicBool::new(false)),
             width: 0,
             height: 0,
+            has_frame: false,
         }
     }
 
@@ -128,6 +134,7 @@ impl INode for DesktopCaster {
                 }
             }
             self.frame_ready.store(false, Ordering::Release);
+            self.has_frame = false;
             self.control.notify();
             return;
         }
@@ -152,6 +159,9 @@ impl INode for DesktopCaster {
         }
         self.frame_ready.store(false, Ordering::Release);
         self.control.notify();
+        // The front buffer now holds a complete frame, so screenshots can
+        // safely clone it until the next resize invalidates it.
+        self.has_frame = true;
 
         // Reuse ImageTexture object to avoid recreation, though PackedByteArray
         // still allocates per frame due to gdext lacking in-place updates.
@@ -253,6 +263,7 @@ impl DesktopCaster {
         self.control.set_target_fps(self.target_fps as u32);
         self.control.clear_error();
         self.frame_ready.store(false, Ordering::Release);
+        self.has_frame = false;
         self.is_running.store(true, Ordering::Release);
         match CaptureThread::spawn(
             self.width,
@@ -290,6 +301,40 @@ impl DesktopCaster {
     #[func]
     pub fn get_texture(&self) -> Option<Gd<ImageTexture>> {
         self.texture.clone()
+    }
+
+    /// Snapshot the current frame as a standalone `Image` (RGBA8).
+    ///
+    /// This clones the front buffer the capture worker keeps up to date, so it
+    /// reuses the active stream's authorization and covers exactly what is
+    /// being cast (the selected monitor or window, at its negotiated size). The
+    /// returned image is the caller's to own; crop or resize it as needed.
+    ///
+    /// Returns `null` until the first frame has arrived, which also covers the
+    /// window right after `start()` or a resolution change, so callers can
+    /// skip rather than send an empty image.
+    #[func]
+    pub fn capture_image(&self) -> Option<Gd<Image>> {
+        if !self.has_frame || self.width == 0 || self.height == 0 {
+            return None;
+        }
+
+        // Copy under the lock so a concurrent resize cannot tear the snapshot.
+        let bytes = {
+            let front = self
+                .front_buffer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            PackedByteArray::from(front.as_slice())
+        };
+
+        Image::create_from_data(
+            self.width as i32,
+            self.height as i32,
+            false,
+            Format::RGBA8,
+            &bytes,
+        )
     }
 
     /// Change FPS mode at runtime.
