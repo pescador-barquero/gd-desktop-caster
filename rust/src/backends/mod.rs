@@ -21,6 +21,14 @@ pub trait CaptureBackend: Send {
     /// an OS frame while still allowing the worker to check shutdown requests.
     fn capture_frame(&mut self, buffer: &mut [u8], timeout_ms: u32) -> Result<bool, CaptureError>;
 
+    /// Report a change in the captured frame dimensions. Backends that can
+    /// deliver frames at a size different from the one requested at `init`
+    /// store it here; the capture worker drains it and asks Godot to
+    /// reallocate its buffers before capturing again.
+    fn take_size_change(&mut self) -> Option<(u32, u32)> {
+        None
+    }
+
     /// Release platform resources before the backend is dropped or recreated.
     fn destroy(&mut self);
 }

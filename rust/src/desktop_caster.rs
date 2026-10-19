@@ -85,6 +85,53 @@ impl INode for DesktopCaster {
             godot_error!("{error}");
         }
 
+        // The capture worker may deliver frames at a different size than the
+        // primary display (window capture, scaled monitors). Reallocate the
+        // buffers and resize the image/texture before consuming any new frame.
+        if let Some((new_width, new_height)) = self.control.take_pending_size() {
+            let new_len = (new_width as usize)
+                .saturating_mul(new_height as usize)
+                .saturating_mul(4);
+            {
+                let mut front = self
+                    .front_buffer
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                front.resize(new_len, 0);
+            }
+            {
+                let mut back = self
+                    .back_buffer
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                back.resize(new_len, 0);
+            }
+            self.width = new_width;
+            self.height = new_height;
+            if let Some(image) = Image::create_empty(
+                new_width as i32,
+                new_height as i32,
+                false,
+                Format::RGBA8,
+            ) {
+                self.image = Some(image.clone());
+                // Resize the existing ImageTexture in place instead of
+                // replacing it. Consumers hold a reference to the same texture
+                // object returned by `get_texture()`, and `update()` cannot
+                // change its dimensions, so `set_image()` (which recreates the
+                // underlying RID and emits `changed`) keeps their reference
+                // valid across resizes.
+                if let Some(texture) = &mut self.texture {
+                    texture.set_image(&image);
+                } else {
+                    self.texture = ImageTexture::create_from_image(&image);
+                }
+            }
+            self.frame_ready.store(false, Ordering::Release);
+            self.control.notify();
+            return;
+        }
+
         if !self.frame_ready.load(Ordering::Acquire) {
             return;
         }
@@ -205,6 +252,7 @@ impl DesktopCaster {
         self.control.set_fps_mode(self.fps_mode);
         self.control.set_target_fps(self.target_fps as u32);
         self.control.clear_error();
+        self.control.take_pending_size();
         self.frame_ready.store(false, Ordering::Release);
         self.is_running.store(true, Ordering::Release);
         match CaptureThread::spawn(
@@ -232,6 +280,7 @@ impl DesktopCaster {
     #[func]
     pub fn stop(&mut self) {
         self.is_running.store(false, Ordering::Release);
+        self.control.take_pending_size();
         self.control.notify();
         if let Some(mut thread) = self.capture_thread.take() {
             thread.shutdown();
