@@ -295,6 +295,7 @@ impl DesktopCaster {
             thread.shutdown();
         }
         self.frame_ready.store(false, Ordering::Release);
+        self.has_frame = false;
     }
 
     /// Get the texture to assign to a TextureRect.

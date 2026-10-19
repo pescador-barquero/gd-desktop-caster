@@ -1,7 +1,21 @@
 use crate::backends::{CaptureBackend, CaptureError};
+use ashpd::desktop::Session;
 use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
-use std::sync::mpsc;
+use std::sync::{mpsc, LazyLock};
 use std::time::Duration;
+
+static TOKIO_RT: LazyLock<Result<tokio::runtime::Runtime, String>> = LazyLock::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .thread_name("pw-tokio")
+        .build()
+        .map_err(|e| format!("Failed to create Tokio runtime: {e}"))
+});
+
+fn tokio_runtime() -> Result<&'static tokio::runtime::Runtime, &'static str> {
+    TOKIO_RT.as_ref().map_err(|e| e.as_str())
+}
 
 // pipewire-rs 0.9+ uses *Rc variants (shared-ownership) instead of unique ones.
 // `spa` is re-exported directly via `pipewire::spa`.
@@ -136,16 +150,14 @@ pub struct PipeWireCaptureBackend {
     /// Frame dimensions that differ from the Godot-side buffers. Drained by
     /// the capture worker, which asks Godot to reallocate before continuing.
     size_change: Option<(u32, u32)>,
+    session: Option<Session<Screencast>>,
 }
 
 impl CaptureBackend for PipeWireCaptureBackend {
     fn init(_width: u32, _height: u32) -> Result<Self, String> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| format!("Tokio runtime error: {e}"))?;
+        let rt = tokio_runtime().map_err(|e| format!("Tokio runtime error: {e}"))?;
 
-        let (pw_fd, node_id) = rt
+        let (pw_fd, node_id, session) = rt
             .block_on(async {
                 let proxy = Screencast::new().await?;
                 let session = proxy.create_session(Default::default()).await?;
@@ -163,7 +175,7 @@ impl CaptureBackend for PipeWireCaptureBackend {
                 let stream = response.streams().first().ok_or(ashpd::Error::NoResponse)?;
                 let fd = proxy.open_pipe_wire_remote(&session, Default::default()).await?;
 
-                Ok::<_, ashpd::Error>((fd, stream.pipe_wire_node_id()))
+                Ok::<_, ashpd::Error>((fd, stream.pipe_wire_node_id(), session))
             })
             .map_err(|e| format!("XDG Portal error: {e}"))?;
 
@@ -307,7 +319,10 @@ impl CaptureBackend for PipeWireCaptureBackend {
                 let _ = startup_tx.send(WorkerStartup::Ready);
 
                 mainloop.run();
-                unsafe { pipewire::deinit() };
+                // Note: Do NOT call pipewire::deinit() here. pipewire::init() initializes
+                // global state tracked via a OnceCell in pipewire-rs. Calling deinit() tears
+                // down the library globally and prevents subsequent re-initialization within
+                // the same process, breaking capture restarts.
             })
             .map_err(|e| format!("Failed to spawn PipeWire thread: {e}"))?;
 
@@ -316,6 +331,11 @@ impl CaptureBackend for PipeWireCaptureBackend {
             Ok(WorkerStartup::Ready) => {}
             Ok(WorkerStartup::Failed(reason)) => {
                 let _ = pw_thread.join();
+                if let Ok(rt) = tokio_runtime() {
+                    let _ = rt.block_on(async {
+                        let _ = tokio::time::timeout(Duration::from_secs(1), session.close()).await;
+                    });
+                }
                 return Err(reason);
             }
             Err(_) => {
@@ -326,6 +346,11 @@ impl CaptureBackend for PipeWireCaptureBackend {
                         "worker thread exited before reporting startup status".to_owned()
                     }
                 };
+                if let Ok(rt) = tokio_runtime() {
+                    let _ = rt.block_on(async {
+                        let _ = tokio::time::timeout(Duration::from_secs(1), session.close()).await;
+                    });
+                }
                 return Err(format!("PipeWire worker thread failed to start: {panic_detail}"));
             }
         }
@@ -335,6 +360,7 @@ impl CaptureBackend for PipeWireCaptureBackend {
             pw_thread: Some(pw_thread),
             quit_sender: Some(quit_sender),
             size_change: None,
+            session: Some(session),
         })
     }
 
@@ -397,6 +423,19 @@ impl CaptureBackend for PipeWireCaptureBackend {
                 );
             }
         }
+        if let Some(session) = self.session.take() {
+            if let Ok(rt) = tokio_runtime() {
+                let _ = rt.block_on(async {
+                    let _ = tokio::time::timeout(Duration::from_secs(1), session.close()).await;
+                });
+            }
+        }
+    }
+}
+
+impl Drop for PipeWireCaptureBackend {
+    fn drop(&mut self) {
+        self.destroy();
     }
 }
 

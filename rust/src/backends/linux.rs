@@ -21,7 +21,14 @@ impl CaptureBackend for LinuxCaptureBackend {
             Err(error) => error,
         };
 
-        // Fallback to X11 XGetImage
+        // Fallback to X11 XGetImage only on X11 sessions.
+        // On Wayland, XGetImage cannot capture Wayland windows or compositor output.
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            return Err(format!(
+                "PipeWire/XDG Portal capture failed on Wayland session: {pipewire_error}"
+            ));
+        }
+
         let x11_error = match x11::X11CaptureBackend::init(width, height) {
             Ok(x11) => {
                 godot::global::godot_print!("Initialized Linux capture via X11 fallback");
