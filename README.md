@@ -148,6 +148,21 @@ public partial class CaptureView : Control
 }
 ```
 
+### 3. Taking a Screenshot
+
+`capture_image()` returns a standalone `Image` of what is currently being cast (the selected monitor or window, at its negotiated size). It reuses the running stream, so it does not trigger a second consent dialog. Save it, share it, or crop it with Godot's own `Image` API.
+
+```gdscript
+func _on_screenshot_pressed() -> void:
+    var image := caster.capture_image()
+    if image == null:
+        # No frame yet, or capture was just (re)started / resized.
+        return
+    # Optionally shrink before sending to reduce bandwidth.
+    image.resize(1280, 720, Image.INTERPOLATE_LANCZOS)
+    image.save_png("user://screenshot.png")
+```
+
 ---
 
 ## 📚 API Reference
@@ -166,7 +181,9 @@ public partial class CaptureView : Control
 | `bool` | **`start()`**<br>Starts desktop capture on a background thread. Automatically detects primary display size. Returns `true` on success. |
 | `void` | **`stop()`**<br>Stops desktop capture and joins the background thread. Called automatically when exiting scene tree. |
 | `ImageTexture` | **`get_texture()`**<br>Returns the live `ImageTexture` updated each frame. Returns `null` if capture has not started. |
+| `Image` | **`capture_image()`**<br>Snapshots the current frame as a standalone RGBA8 `Image`, reusing the active stream (same authorization and geometry as the cast). Returns `null` until the first frame has arrived, right after a resolution change, or after stopping. |
 | `bool` | **`is_capturing()`**<br>Returns `true` if the capture thread is currently running. |
+| `bool` | **`has_frame()`**<br>Returns `true` if at least one complete frame has been captured and uploaded to the texture. Returns `false` before the first frame arrives, right after a resolution change, or after stopping. |
 | `String` | **`get_last_error()`**<br>Returns the last error message reported by the capture thread, or empty string if no error. |
 | `void` | **`set_fps_mode_runtime(mode: int)`**<br>Changes the FPS mode while capture is running without restarting the thread. |
 | `void` | **`set_target_fps_runtime(target_fps: int)`**<br>Changes target frame rate while capture is running (for `MANUAL` mode). |

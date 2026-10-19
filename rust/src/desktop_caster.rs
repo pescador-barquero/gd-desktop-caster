@@ -55,6 +55,11 @@ pub struct DesktopCaster {
 
     width: u32,
     height: u32,
+    /// True once a real frame has been swapped into `front_buffer`. Distinct
+    /// from `frame_ready` (which is cleared immediately after each swap):
+    /// callers need to know the front buffer and texture hold actual pixels
+    /// rather than the zeroed allocation from `start()` or a resize.
+    has_frame: bool,
 }
 
 #[godot_api]
@@ -74,6 +79,7 @@ impl INode for DesktopCaster {
             frame_ready: Arc::new(AtomicBool::new(false)),
             width: 0,
             height: 0,
+            has_frame: false,
         }
     }
 
@@ -128,6 +134,7 @@ impl INode for DesktopCaster {
                 }
             }
             self.frame_ready.store(false, Ordering::Release);
+            self.has_frame = false;
             self.control.notify();
             return;
         }
@@ -152,6 +159,7 @@ impl INode for DesktopCaster {
         }
         self.frame_ready.store(false, Ordering::Release);
         self.control.notify();
+        self.has_frame = true;
 
         // Reuse ImageTexture object to avoid recreation, though PackedByteArray
         // still allocates per frame due to gdext lacking in-place updates.
@@ -255,6 +263,7 @@ impl DesktopCaster {
         self.control.clear_error();
         self.control.take_pending_size();
         self.frame_ready.store(false, Ordering::Release);
+        self.has_frame = false;
         self.is_running.store(true, Ordering::Release);
         match CaptureThread::spawn(
             self.width,
@@ -287,12 +296,53 @@ impl DesktopCaster {
             thread.shutdown();
         }
         self.frame_ready.store(false, Ordering::Release);
+        self.has_frame = false;
+    }
+
+    /// Returns true if at least one complete frame has been captured and uploaded
+    /// to the texture. Returns false before the first frame arrives, right after
+    /// a resolution change, or after stopping.
+    #[func]
+    pub fn has_frame(&self) -> bool {
+        self.has_frame
     }
 
     /// Get the texture to assign to a TextureRect.
     #[func]
     pub fn get_texture(&self) -> Option<Gd<ImageTexture>> {
         self.texture.clone()
+    }
+
+    /// Snapshot the current frame as a standalone `Image` (RGBA8).
+    ///
+    /// Reuses the active stream's authorization and covers what is currently
+    /// being cast (the selected monitor or window, at its negotiated size).
+    /// Allocates a new `Image` so subsequent frames updating `self.image` in
+    /// place do not overwrite the caller's snapshot.
+    ///
+    /// Returns `null` when `has_frame()` is `false` (before the first frame,
+    /// right after a resolution change, or after stopping).
+    #[func]
+    pub fn capture_image(&self) -> Option<Gd<Image>> {
+        if !self.has_frame || self.width == 0 || self.height == 0 {
+            return None;
+        }
+
+        let bytes = {
+            let front = self
+                .front_buffer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            PackedByteArray::from(front.as_slice())
+        };
+
+        Image::create_from_data(
+            self.width as i32,
+            self.height as i32,
+            false,
+            Format::RGBA8,
+            &bytes,
+        )
     }
 
     /// Change FPS mode at runtime.

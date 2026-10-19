@@ -47,10 +47,22 @@
 				Returns [code]null[/code] if [method start] has not been called yet.
 			</description>
 		</method>
+		<method name="capture_image">
+			<return type="Image" />
+			<description>
+				Snapshots the current frame as a standalone RGBA8 [Image], reusing the active stream's authorization and geometry. Returns [code]null[/code] when [method has_frame] is [code]false[/code] (before the first frame arrives, right after a resolution change, or after stopping).
+			</description>
+		</method>
 		<method name="is_capturing">
 			<return type="bool" />
 			<description>
 				Returns [code]true[/code] if the capture thread is currently running.
+			</description>
+		</method>
+		<method name="has_frame">
+			<return type="bool" />
+			<description>
+				Returns [code]true[/code] if at least one complete frame has been captured and uploaded to the texture. Returns [code]false[/code] before the first frame arrives, right after a resolution change, or after stopping.
 			</description>
 		</method>
 		<method name="get_last_error">
