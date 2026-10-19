@@ -76,7 +76,31 @@
 				Changes the target frame rate while capture is already running. Only meaningful when [member fps_mode] is [constant FpsMode.MANUAL]. Values outside the range [code]1..240[/code] are clamped to [code]30[/code] to prevent a busy-polling loop.
 			</description>
 		</method>
+		<method name="has_frame">
+			<return type="bool" />
+			<description>
+				Returns [code]true[/code] if at least one complete frame has been captured and uploaded to the texture. Returns [code]false[/code] before the first frame arrives, or after stopping.
+			</description>
+		</method>
 	</methods>
+	<signals>
+		<signal name="first_frame_received">
+			<description>
+				Emitted when the first frame of a capture session has been received and uploaded to the texture. Useful for hiding placeholder graphics once the stream begins.
+			</description>
+		</signal>
+		<signal name="capture_failed">
+			<param index="0" name="error" type="String" />
+			<description>
+				Emitted if capture fails to start or encounters an error (e.g. portal dialog cancelled or display error).
+			</description>
+		</signal>
+		<signal name="capture_stopped">
+			<description>
+				Emitted when capture is stopped, either explicitly via [method stop] or when the stream terminates.
+			</description>
+		</signal>
+	</signals>
 	<members>
 		<member name="fps_mode" type="int" setter="set_fps_mode" getter="get_fps_mode" enum="DesktopCaster.FpsMode" default="0">
 			Controls how the capture rate is determined. Use [constant FpsMode.MANUAL] to set a fixed FPS, or [constant FpsMode.VSYNC] to sync with the OS compositor.

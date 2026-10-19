@@ -60,6 +60,7 @@ pub struct DesktopCaster {
     /// screenshots need to know the front buffer holds actual pixels rather
     /// than the zeroed allocation from `start()` or a resize.
     has_frame: bool,
+    first_frame_emitted: bool,
 }
 
 #[godot_api]
@@ -80,6 +81,7 @@ impl INode for DesktopCaster {
             width: 0,
             height: 0,
             has_frame: false,
+            first_frame_emitted: false,
         }
     }
 
@@ -89,6 +91,14 @@ impl INode for DesktopCaster {
         // background thread.
         if let Some(error) = self.control.take_pending_error() {
             godot_error!("{error}");
+            self.signals().capture_failed().emit(&GString::from(error.as_str()));
+        }
+
+        // If the worker thread stopped on its own (error, portal cancelled, or stream closed),
+        // clean up state and emit capture_stopped.
+        if self.capture_thread.is_some() && !self.is_running.load(Ordering::Acquire) {
+            self.stop();
+            return;
         }
 
         // The capture worker may deliver frames at a different size than the
@@ -168,6 +178,7 @@ impl INode for DesktopCaster {
         // TODO: Revisit if gdext adds support for writing into existing arrays.
         if let Some(ref mut image) = self.image {
             let byte_array = PackedByteArray::from(front.as_slice());
+            drop(front);
 
             // Update image data in-place (no new Image created!)
             image.set_data(
@@ -182,6 +193,11 @@ impl INode for DesktopCaster {
             if let Some(ref mut tex) = self.texture {
                 tex.update(&*image);
             }
+
+            if !self.first_frame_emitted {
+                self.first_frame_emitted = true;
+                self.signals().first_frame_received().emit();
+            }
         }
     }
 
@@ -192,6 +208,19 @@ impl INode for DesktopCaster {
 
 #[godot_api]
 impl DesktopCaster {
+    /// Emitted when the first frame of a capture session has been received
+    /// and uploaded to the texture.
+    #[signal]
+    fn first_frame_received();
+
+    /// Emitted if capture fails to start or encounters an error (e.g. portal cancelled).
+    #[signal]
+    fn capture_failed(error: GString);
+
+    /// Emitted when capture is stopped, either explicitly or when the stream terminates.
+    #[signal]
+    fn capture_stopped();
+
     /// Start capture. Manual mode defaults to 30 FPS.
     #[func]
     pub fn start(&mut self) -> bool {
@@ -212,8 +241,9 @@ impl DesktopCaster {
         let (width, height) = match (u32::try_from(screen_size.x), u32::try_from(screen_size.y)) {
             (Ok(width), Ok(height)) if width > 0 && height > 0 => (width, height),
             _ => {
-                self.control
-                    .report_error("[DesktopCaster] Primary display has an invalid size.");
+                let err = "[DesktopCaster] Primary display has an invalid size.";
+                self.control.report_error(err);
+                self.signals().capture_failed().emit(&GString::from(err));
                 return false;
             }
         };
@@ -221,24 +251,27 @@ impl DesktopCaster {
             .checked_mul(height as usize)
             .and_then(|pixels| pixels.checked_mul(4))
         else {
-            self.control
-                .report_error("[DesktopCaster] Capture buffer size overflows this platform.");
+            let err = "[DesktopCaster] Capture buffer size overflows this platform.";
+            self.control.report_error(err);
+            self.signals().capture_failed().emit(&GString::from(err));
             return false;
         };
 
         let image = match Image::create_empty(width as i32, height as i32, false, Format::RGBA8) {
             Some(image) => image,
             None => {
-                self.control
-                    .report_error("[DesktopCapture] Image allocation failed.");
+                let err = "[DesktopCapture] Image allocation failed.";
+                self.control.report_error(err);
+                self.signals().capture_failed().emit(&GString::from(err));
                 return false;
             }
         };
         let texture = match ImageTexture::create_from_image(&image) {
             Some(texture) => texture,
             None => {
-                self.control
-                    .report_error("[DesktopCapture] Texture allocation failed.");
+                let err = "[DesktopCapture] Texture allocation failed.";
+                self.control.report_error(err);
+                self.signals().capture_failed().emit(&GString::from(err));
                 return false;
             }
         };
@@ -264,6 +297,7 @@ impl DesktopCaster {
         self.control.clear_error();
         self.frame_ready.store(false, Ordering::Release);
         self.has_frame = false;
+        self.first_frame_emitted = false;
         self.is_running.store(true, Ordering::Release);
         match CaptureThread::spawn(
             self.width,
@@ -279,8 +313,9 @@ impl DesktopCaster {
             }
             Err(error) => {
                 self.is_running.store(false, Ordering::Release);
-                self.control
-                    .report_error(format!("[DesktopCaster] {error}"));
+                let err_msg = format!("[DesktopCaster] {error}");
+                self.control.report_error(&err_msg);
+                self.signals().capture_failed().emit(&GString::from(err_msg.as_str()));
                 false
             }
         }
@@ -289,13 +324,24 @@ impl DesktopCaster {
     /// Stop capture.
     #[func]
     pub fn stop(&mut self) {
-        self.is_running.store(false, Ordering::Release);
+        let was_running = self.is_running.swap(false, Ordering::Release) || self.capture_thread.is_some();
         self.control.notify();
         if let Some(mut thread) = self.capture_thread.take() {
             thread.shutdown();
         }
         self.frame_ready.store(false, Ordering::Release);
         self.has_frame = false;
+        self.first_frame_emitted = false;
+        if was_running {
+            self.signals().capture_stopped().emit();
+        }
+    }
+
+    /// Returns true if at least one complete frame has been captured and uploaded
+    /// to the texture. Returns false before the first frame arrives, or after stopping.
+    #[func]
+    pub fn has_frame(&self) -> bool {
+        self.has_frame
     }
 
     /// Get the texture to assign to a TextureRect.

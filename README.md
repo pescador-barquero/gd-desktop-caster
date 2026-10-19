@@ -183,9 +183,18 @@ func _on_screenshot_pressed() -> void:
 | `ImageTexture` | **`get_texture()`**<br>Returns the live `ImageTexture` updated each frame. Returns `null` if capture has not started. |
 | `Image` | **`capture_image()`**<br>Snapshots the current frame as a standalone RGBA8 `Image`, reusing the active stream (same authorization and geometry as the cast). Returns `null` until the first frame has arrived, or right after a resolution change. |
 | `bool` | **`is_capturing()`**<br>Returns `true` if the capture thread is currently running. |
+| `bool` | **`has_frame()`**<br>Returns `true` if at least one complete frame has been captured and uploaded to the texture. Returns `false` before the first frame arrives, or after stopping. |
 | `String` | **`get_last_error()`**<br>Returns the last error message reported by the capture thread, or empty string if no error. |
 | `void` | **`set_fps_mode_runtime(mode: int)`**<br>Changes the FPS mode while capture is running without restarting the thread. |
 | `void` | **`set_target_fps_runtime(target_fps: int)`**<br>Changes target frame rate while capture is running (for `MANUAL` mode). |
+
+### Signals
+
+| Signal & Description |
+| :--- |
+| **`first_frame_received()`**<br>Emitted once when the first frame of a capture session has arrived and uploaded to the texture. Useful for hiding placeholder graphics or loading indicators. |
+| **`capture_failed(error: String)`**<br>Emitted if capture fails to start or encounters an unrecoverable error (e.g. portal dialog cancelled). |
+| **`capture_stopped()`**<br>Emitted when capture stops, either explicitly via `stop()` or when the stream terminates. |
 
 ### Enumerations & Constants
 
