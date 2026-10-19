@@ -58,5 +58,3 @@ impl CaptureBackend for LinuxCaptureBackend {
         }
     }
 }
-
-pub type PlatformBackend = LinuxCaptureBackend;
