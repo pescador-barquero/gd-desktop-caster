@@ -224,14 +224,16 @@ impl DesktopCaster {
                 return false;
             }
         };
-        let texture = match ImageTexture::create_from_image(&image) {
-            Some(texture) => texture,
-            None => {
+        if let Some(texture) = &mut self.texture {
+            texture.set_image(&image);
+        } else {
+            let Some(texture) = ImageTexture::create_from_image(&image) else {
                 self.control
                     .report_error("[DesktopCapture] Texture allocation failed.");
                 return false;
-            }
-        };
+            };
+            self.texture = Some(texture);
+        }
 
         self.width = width;
         self.height = height;
@@ -244,7 +246,6 @@ impl DesktopCaster {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = vec![0; buf_size];
         self.image = Some(image);
-        self.texture = Some(texture);
 
         // Invalid Inspector/script values fall back to Manual's documented
         // default rather than becoming a tight polling loop.
