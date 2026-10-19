@@ -9,13 +9,48 @@ use pipewire::context::ContextRc;
 use pipewire::main_loop::MainLoopRc;
 // Explicitly import macro to avoid shadowing by the `pipewire::properties` module.
 use pipewire::properties::properties;
-use pipewire::spa::utils::Direction;
+use pipewire::spa::param::format::{FormatProperties, MediaSubtype, MediaType};
+use pipewire::spa::param::video::VideoFormat;
+use pipewire::spa::param::ParamType;
+use pipewire::spa::pod::serialize::PodSerializer;
+use pipewire::spa::pod::{Pod, Value};
+use pipewire::spa::utils::{Direction, SpaTypes};
 use pipewire::stream::{StreamFlags, StreamRc};
 
 /// Status message to sync the worker thread startup with `init()`.
 enum WorkerStartup {
     Ready,
     Failed(String),
+}
+
+/// Serialize an `EnumFormat` pod requesting raw video in the 4-byte BGR
+/// layouts the frame conversion understands.
+///
+/// The pod deliberately carries no `VideoModifier` property: PipeWire only
+/// negotiates DMA-BUF when modifiers are part of the format, so leaving them
+/// out makes the producer fall back to shared memory (`MemFd`/`MemPtr`) that
+/// `MAP_BUFFERS` can map for CPU reads.
+fn build_raw_format_params() -> Result<Vec<u8>, String> {
+    let obj = pipewire::spa::pod::object!(
+        SpaTypes::ObjectParamFormat,
+        ParamType::EnumFormat,
+        pipewire::spa::pod::property!(FormatProperties::MediaType, Id, MediaType::Video),
+        pipewire::spa::pod::property!(FormatProperties::MediaSubtype, Id, MediaSubtype::Raw),
+        // In a SPA `Choice::Enum` the first value is the preferred default and
+        // the remaining values are the alternatives, hence BGRx appears twice.
+        pipewire::spa::pod::property!(
+            FormatProperties::VideoFormat,
+            Choice,
+            Enum,
+            Id,
+            VideoFormat::BGRx,
+            VideoFormat::BGRx,
+            VideoFormat::BGRA
+        ),
+    );
+    PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(obj))
+        .map(|(cursor, _)| cursor.into_inner())
+        .map_err(|error| format!("{error:?}"))
 }
 
 pub struct PipeWireCaptureBackend {
@@ -125,7 +160,7 @@ impl CaptureBackend for PipeWireCaptureBackend {
                                             for (d, s) in
                                                 out.chunks_exact_mut(4).zip(map.chunks_exact(4))
                                             {
-                                                // Convert BGRx -> RGBA.
+                                                // Convert BGRx/BGRA -> RGBA.
                                                 d[0] = s[2]; // R
                                                 d[1] = s[1]; // G
                                                 d[2] = s[0]; // B
@@ -142,11 +177,24 @@ impl CaptureBackend for PipeWireCaptureBackend {
                     "Failed to register PipeWire stream listener"
                 );
 
+                // Without a format request the producer's own format (with
+                // DMA-BUF modifiers) is accepted as-is and buffers arrive as
+                // unmapped dma-bufs, so `data.data()` is `None` for every frame.
+                let format_bytes = try_setup!(
+                    build_raw_format_params(),
+                    "Failed to serialize capture format params"
+                );
+                let format_pod = try_setup!(
+                    Pod::from_bytes(&format_bytes).ok_or("invalid pod"),
+                    "Failed to parse capture format params"
+                );
+                let mut params = [format_pod];
+
                 let connect_result = stream.connect(
                     Direction::Input,
                     Some(node_id),
                     StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS,
-                    &mut [],
+                    &mut params,
                 );
                 if let Err(error) = connect_result {
                     let _ = startup_tx.send(WorkerStartup::Failed(format!(
