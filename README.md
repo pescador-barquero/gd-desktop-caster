@@ -25,6 +25,7 @@
   - [📚 API Reference](#-api-reference)
     - [Properties](#properties)
     - [Methods](#methods)
+    - [Signals](#signals)
     - [Enumerations \& Constants](#enumerations--constants)
   - [🏗 Building from Source](#-building-from-source)
     - [Prerequisites](#prerequisites)
@@ -187,6 +188,14 @@ func _on_screenshot_pressed() -> void:
 | `String` | **`get_last_error()`**<br>Returns the last error message reported by the capture thread, or empty string if no error. |
 | `void` | **`set_fps_mode_runtime(mode: int)`**<br>Changes the FPS mode while capture is running without restarting the thread. |
 | `void` | **`set_target_fps_runtime(target_fps: int)`**<br>Changes target frame rate while capture is running (for `MANUAL` mode). |
+
+### Signals
+
+| Signal | Description |
+| :--- | :--- |
+| **`first_frame_received()`** | Emitted once per capture session when the first frame has been received and uploaded to the texture. On Wayland/PipeWire, where `start()` returns while the XDG Portal dialog is still awaiting user selection, this signal marks when actual video capture has begun. |
+| **`capture_failed(error: String)`** | Emitted when capture fails to start (including when the user cancels the XDG Portal dialog) or terminates due to a fatal backend error. |
+| **`capture_stopped()`** | Emitted when an active capture session stops, either via `stop()` or when the capture stream ends after having started. |
 
 ### Enumerations & Constants
 

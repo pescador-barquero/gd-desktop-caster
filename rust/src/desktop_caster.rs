@@ -60,6 +60,10 @@ pub struct DesktopCaster {
     /// callers need to know the front buffer and texture hold actual pixels
     /// rather than the zeroed allocation from `start()` or a resize.
     has_frame: bool,
+    /// True once `first_frame_received` has fired for the current session.
+    /// Kept separate from `has_frame` because a mid-stream resolution change
+    /// temporarily clears `has_frame` without starting a new session.
+    first_frame_emitted: bool,
 }
 
 #[godot_api]
@@ -80,6 +84,7 @@ impl INode for DesktopCaster {
             width: 0,
             height: 0,
             has_frame: false,
+            first_frame_emitted: false,
         }
     }
 
@@ -87,8 +92,29 @@ impl INode for DesktopCaster {
         // Godot APIs are called only from this main-thread callback. Worker
         // errors are forwarded through CaptureControl instead of logged from a
         // background thread.
+        let worker_stopped =
+            self.capture_thread.is_some() && !self.is_running.load(Ordering::Acquire);
         if let Some(error) = self.control.take_pending_error() {
             godot_error!("{error}");
+            if worker_stopped {
+                let had_started = self.first_frame_emitted;
+                self.cleanup_thread();
+                self.signals()
+                    .capture_failed()
+                    .emit(&GString::from(error.as_str()));
+                if had_started {
+                    self.signals().capture_stopped().emit();
+                }
+                return;
+            }
+        }
+        if worker_stopped {
+            let had_started = self.first_frame_emitted;
+            self.cleanup_thread();
+            if had_started {
+                self.signals().capture_stopped().emit();
+            }
+            return;
         }
 
         // The capture worker may deliver frames at a different size than the
@@ -166,6 +192,7 @@ impl INode for DesktopCaster {
         // TODO: Revisit if gdext adds support for writing into existing arrays.
         if let Some(ref mut image) = self.image {
             let byte_array = PackedByteArray::from(front.as_slice());
+            drop(front);
 
             // Update image data in-place (no new Image created!)
             image.set_data(
@@ -180,6 +207,13 @@ impl INode for DesktopCaster {
             if let Some(ref mut tex) = self.texture {
                 tex.update(&*image);
             }
+        } else {
+            drop(front);
+        }
+
+        if !self.first_frame_emitted {
+            self.first_frame_emitted = true;
+            self.signals().first_frame_received().emit();
         }
     }
 
@@ -190,6 +224,21 @@ impl INode for DesktopCaster {
 
 #[godot_api]
 impl DesktopCaster {
+    /// Emitted once per capture session when the first frame has arrived and
+    /// been uploaded to the texture.
+    #[signal]
+    fn first_frame_received();
+
+    /// Emitted when capture fails to start or stops due to an unrecoverable
+    /// error (e.g. XDG portal dialog cancelled or backend failure).
+    #[signal]
+    fn capture_failed(error: GString);
+
+    /// Emitted when capture stops, either via `stop()` or when an active
+    /// stream terminates.
+    #[signal]
+    fn capture_stopped();
+
     /// Start capture. Manual mode defaults to 30 FPS.
     #[func]
     pub fn start(&mut self) -> bool {
@@ -200,7 +249,7 @@ impl DesktopCaster {
         // Explicitly join any previous worker that stopped on its own (e.g.
         // on a fatal error) to prevent unexpected blocking during Drop.
         if self.capture_thread.is_some() {
-            self.stop();
+            self.cleanup_thread();
         }
 
         let screen_size = DisplayServer::singleton()
@@ -210,35 +259,28 @@ impl DesktopCaster {
         let (width, height) = match (u32::try_from(screen_size.x), u32::try_from(screen_size.y)) {
             (Ok(width), Ok(height)) if width > 0 && height > 0 => (width, height),
             _ => {
-                self.control
-                    .report_error("[DesktopCaster] Primary display has an invalid size.");
-                return false;
+                return self.fail_start("[DesktopCaster] Primary display has an invalid size.");
             }
         };
         let Some(buf_size) = (width as usize)
             .checked_mul(height as usize)
             .and_then(|pixels| pixels.checked_mul(4))
         else {
-            self.control
-                .report_error("[DesktopCaster] Capture buffer size overflows this platform.");
-            return false;
+            return self
+                .fail_start("[DesktopCaster] Capture buffer size overflows this platform.");
         };
 
         let image = match Image::create_empty(width as i32, height as i32, false, Format::RGBA8) {
             Some(image) => image,
             None => {
-                self.control
-                    .report_error("[DesktopCapture] Image allocation failed.");
-                return false;
+                return self.fail_start("[DesktopCapture] Image allocation failed.");
             }
         };
         if let Some(texture) = &mut self.texture {
             texture.set_image(&image);
         } else {
             let Some(texture) = ImageTexture::create_from_image(&image) else {
-                self.control
-                    .report_error("[DesktopCapture] Texture allocation failed.");
-                return false;
+                return self.fail_start("[DesktopCapture] Texture allocation failed.");
             };
             self.texture = Some(texture);
         }
@@ -264,6 +306,7 @@ impl DesktopCaster {
         self.control.take_pending_size();
         self.frame_ready.store(false, Ordering::Release);
         self.has_frame = false;
+        self.first_frame_emitted = false;
         self.is_running.store(true, Ordering::Release);
         match CaptureThread::spawn(
             self.width,
@@ -279,9 +322,7 @@ impl DesktopCaster {
             }
             Err(error) => {
                 self.is_running.store(false, Ordering::Release);
-                self.control
-                    .report_error(format!("[DesktopCaster] {error}"));
-                false
+                self.fail_start(format!("[DesktopCaster] {error}"))
             }
         }
     }
@@ -289,14 +330,12 @@ impl DesktopCaster {
     /// Stop capture.
     #[func]
     pub fn stop(&mut self) {
-        self.is_running.store(false, Ordering::Release);
-        self.control.take_pending_size();
-        self.control.notify();
-        if let Some(mut thread) = self.capture_thread.take() {
-            thread.shutdown();
+        let was_active =
+            self.is_running.load(Ordering::Acquire) || self.first_frame_emitted;
+        self.cleanup_thread();
+        if was_active {
+            self.signals().capture_stopped().emit();
         }
-        self.frame_ready.store(false, Ordering::Release);
-        self.has_frame = false;
     }
 
     /// Returns true if at least one complete frame has been captured and uploaded
@@ -377,5 +416,26 @@ impl DesktopCaster {
         } else {
             30
         }
+    }
+
+    fn cleanup_thread(&mut self) {
+        self.is_running.store(false, Ordering::Release);
+        self.control.take_pending_size();
+        self.control.notify();
+        if let Some(mut thread) = self.capture_thread.take() {
+            thread.shutdown();
+        }
+        self.frame_ready.store(false, Ordering::Release);
+        self.has_frame = false;
+        self.first_frame_emitted = false;
+    }
+
+    fn fail_start(&mut self, error: impl Into<String>) -> bool {
+        let error = error.into();
+        self.control.report_error(error.clone());
+        self.signals()
+            .capture_failed()
+            .emit(&GString::from(error.as_str()));
+        false
     }
 }

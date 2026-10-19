@@ -97,6 +97,24 @@
 			Target frame rate when [member fps_mode] is [constant FpsMode.MANUAL]. Values outside [code]1..240[/code] are clamped to [code]30[/code].
 		</member>
 	</members>
+	<signals>
+		<signal name="first_frame_received">
+			<description>
+				Emitted once per capture session when the first frame has been received and uploaded to the texture. On Wayland/PipeWire, where [method start] returns while the XDG Portal dialog is still awaiting user selection, this signal marks when actual video capture has begun.
+			</description>
+		</signal>
+		<signal name="capture_failed">
+			<param index="0" name="error" type="String" />
+			<description>
+				Emitted when capture fails to start (including when the user cancels the XDG Portal dialog) or terminates due to a fatal backend error.
+			</description>
+		</signal>
+		<signal name="capture_stopped">
+			<description>
+				Emitted when an active capture session stops, either via [method stop] or when the capture stream ends after having started.
+			</description>
+		</signal>
+	</signals>
 	<constants>
 		<constant name="MANUAL" value="0" enum="FpsMode">
 			Capture at a user-selected rate (see [member target_fps]). The default is 30 FPS.
