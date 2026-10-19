@@ -9,8 +9,10 @@ use pipewire::context::ContextRc;
 use pipewire::main_loop::MainLoopRc;
 // Explicitly import macro to avoid shadowing by the `pipewire::properties` module.
 use pipewire::properties::properties;
+use pipewire::spa::buffer::{Chunk, ChunkFlags};
 use pipewire::spa::param::format::{FormatProperties, MediaSubtype, MediaType};
-use pipewire::spa::param::video::VideoFormat;
+use pipewire::spa::param::format_utils;
+use pipewire::spa::param::video::{VideoFormat, VideoInfoRaw};
 use pipewire::spa::param::ParamType;
 use pipewire::spa::pod::serialize::PodSerializer;
 use pipewire::spa::pod::{Pod, Value};
@@ -51,6 +53,85 @@ fn build_raw_format_params() -> Result<Vec<u8>, String> {
     PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(obj))
         .map(|(cursor, _)| cursor.into_inner())
         .map_err(|error| format!("{error:?}"))
+}
+
+/// Extract the frame size from a negotiated `Format` param, provided it is one
+/// of the raw layouts requested by `build_raw_format_params`.
+fn parse_negotiated_size(param: &Pod) -> Option<(u32, u32)> {
+    let (media_type, media_subtype) = format_utils::parse_format(param).ok()?;
+    if media_type != MediaType::Video || media_subtype != MediaSubtype::Raw {
+        return None;
+    }
+    let mut info = VideoInfoRaw::new();
+    info.parse(param).ok()?;
+    if info.format() != VideoFormat::BGRx && info.format() != VideoFormat::BGRA {
+        return None;
+    }
+    let size = info.size();
+    (size.width > 0 && size.height > 0).then_some((size.width, size.height))
+}
+
+/// The `spa_chunk` fields describing where the valid pixels live in a buffer.
+#[derive(Clone, Copy)]
+struct FrameChunk {
+    offset: u32,
+    size: u32,
+    stride: i32,
+    corrupted: bool,
+}
+
+impl From<&Chunk> for FrameChunk {
+    fn from(chunk: &Chunk) -> Self {
+        Self {
+            offset: chunk.offset(),
+            size: chunk.size(),
+            stride: chunk.stride(),
+            corrupted: chunk.flags().contains(ChunkFlags::CORRUPTED),
+        }
+    }
+}
+
+/// Convert a mapped BGRx/BGRA buffer into tightly packed RGBA8.
+///
+/// Honors the chunk offset, size and row stride, so padded rows work. Returns
+/// `None` for frames that do not contain `height` complete rows, so a partial
+/// or corrupted buffer is dropped rather than shown as a black frame.
+fn convert_to_rgba(map: &[u8], chunk: FrameChunk, width: u32, height: u32) -> Option<Vec<u8>> {
+    if chunk.corrupted || height == 0 {
+        return None;
+    }
+    let width = width as usize;
+    let height = height as usize;
+    let row_bytes = width.checked_mul(4)?;
+    // A zero stride means tightly packed rows. Negative (bottom-up) strides
+    // are not produced for screen capture and are rejected.
+    let stride = match chunk.stride {
+        0 => row_bytes,
+        stride => usize::try_from(stride).ok()?,
+    };
+    if stride < row_bytes {
+        return None;
+    }
+
+    let start = chunk.offset as usize;
+    let end = start.checked_add(chunk.size as usize)?.min(map.len());
+    let frame = map.get(start..end)?;
+    // The last row does not need trailing stride padding.
+    let needed = stride.checked_mul(height - 1)?.checked_add(row_bytes)?;
+    if frame.len() < needed {
+        return None;
+    }
+
+    let mut out = vec![0u8; row_bytes.checked_mul(height)?];
+    for (src_row, dst_row) in frame.chunks(stride).zip(out.chunks_exact_mut(row_bytes)) {
+        for (d, s) in dst_row.chunks_exact_mut(4).zip(src_row[..row_bytes].chunks_exact(4)) {
+            d[0] = s[2]; // R
+            d[1] = s[1]; // G
+            d[2] = s[0]; // B
+            d[3] = 255; // A
+        }
+    }
+    Some(out)
 }
 
 pub struct PipeWireCaptureBackend {
@@ -143,30 +224,35 @@ impl CaptureBackend for PipeWireCaptureBackend {
                     loop_clone.quit();
                 });
 
-                let buffer_size = (width * height * 4) as usize;
-
                 let _listener = try_setup!(
                     stream
-                        .add_local_listener_with_user_data(())
-                        .process(move |stream, _| {
+                        .add_local_listener_with_user_data(None::<(u32, u32)>)
+                        .param_changed(|_, negotiated_size, id, param| {
+                            if id != ParamType::Format.as_raw() {
+                                return;
+                            }
+                            *negotiated_size = param.and_then(parse_negotiated_size);
+                        })
+                        .process(move |stream, negotiated_size| {
+                            // Buffers only carry pixels once a format is negotiated.
+                            let Some((frame_width, frame_height)) = *negotiated_size else {
+                                return;
+                            };
                             if let Some(mut buffer) = stream.dequeue_buffer() {
                                 let datas = buffer.datas_mut();
                                 if let Some(data) = datas.first_mut() {
+                                    let chunk = FrameChunk::from(data.chunk());
                                     // Renamed to `data()` in pipewire 0.9.
                                     if let Some(map) = data.data() {
-                                        // Validate buffer size before processing.
-                                        if map.len() == buffer_size {
-                                            let mut out = vec![0u8; buffer_size];
-                                            for (d, s) in
-                                                out.chunks_exact_mut(4).zip(map.chunks_exact(4))
+                                        // The Godot-side buffers still have the
+                                        // size requested at init; drop frames of
+                                        // any other size.
+                                        if (frame_width, frame_height) == (width, height) {
+                                            if let Some(out) =
+                                                convert_to_rgba(map, chunk, frame_width, frame_height)
                                             {
-                                                // Convert BGRx/BGRA -> RGBA.
-                                                d[0] = s[2]; // R
-                                                d[1] = s[1]; // G
-                                                d[2] = s[0]; // B
-                                                d[3] = 255;  // A
+                                                let _ = tx.try_send(out);
                                             }
-                                            let _ = tx.try_send(out);
                                         }
                                     }
                                 }
@@ -190,10 +276,14 @@ impl CaptureBackend for PipeWireCaptureBackend {
                 );
                 let mut params = [format_pod];
 
+                // No RT_PROCESS: `process` must run on this mainloop thread,
+                // like `param_changed`, because both share the listener state.
+                // This thread is dedicated to the stream, and the per-frame
+                // conversion allocates, so a realtime data thread buys nothing.
                 let connect_result = stream.connect(
                     Direction::Input,
                     Some(node_id),
-                    StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS,
+                    StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS,
                     &mut params,
                 );
                 if let Err(error) = connect_result {
@@ -307,5 +397,84 @@ fn describe_panic_payload(payload: &Box<dyn std::any::Any + Send>) -> String {
         message.clone()
     } else {
         "<non-string panic payload>".to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FrameChunk, convert_to_rgba};
+
+    /// A 2x2 BGRx frame whose rows are `stride` bytes apart (padding = 0xEE),
+    /// preceded by `offset` bytes of garbage.
+    fn frame(stride: usize, offset: usize) -> Vec<u8> {
+        let mut map = vec![0xEE; offset];
+        for row in 0..2u8 {
+            let mut line = vec![0xEE; stride];
+            for col in 0..2u8 {
+                let px = row * 2 + col;
+                line[col as usize * 4..col as usize * 4 + 4].copy_from_slice(&[px, 10 + px, 20 + px, 0]);
+            }
+            map.extend_from_slice(&line);
+        }
+        map
+    }
+
+    fn chunk(offset: usize, size: usize, stride: i32) -> FrameChunk {
+        FrameChunk {
+            offset: offset as u32,
+            size: size as u32,
+            stride,
+            corrupted: false,
+        }
+    }
+
+    const EXPECTED: [u8; 16] = [
+        20, 10, 0, 255, 21, 11, 1, 255, //
+        22, 12, 2, 255, 23, 13, 3, 255,
+    ];
+
+    #[test]
+    fn swizzles_tightly_packed_frames() {
+        let map = frame(8, 0);
+        assert_eq!(convert_to_rgba(&map, chunk(0, 16, 8), 2, 2).unwrap(), EXPECTED);
+    }
+
+    #[test]
+    fn zero_stride_means_tightly_packed() {
+        let map = frame(8, 0);
+        assert_eq!(convert_to_rgba(&map, chunk(0, 16, 0), 2, 2).unwrap(), EXPECTED);
+    }
+
+    #[test]
+    fn skips_row_padding_and_chunk_offset() {
+        let map = frame(12, 4);
+        assert_eq!(convert_to_rgba(&map, chunk(4, 24, 12), 2, 2).unwrap(), EXPECTED);
+    }
+
+    #[test]
+    fn last_row_needs_no_trailing_padding() {
+        let map = frame(12, 0);
+        assert_eq!(convert_to_rgba(&map, chunk(0, 20, 12), 2, 2).unwrap(), EXPECTED);
+    }
+
+    #[test]
+    fn drops_incomplete_frames() {
+        let map = frame(8, 0);
+        assert!(convert_to_rgba(&map, chunk(0, 15, 8), 2, 2).is_none());
+        // A chunk claiming more bytes than are mapped is clamped to the map.
+        assert!(convert_to_rgba(&map[..12], chunk(0, 16, 8), 2, 2).is_none());
+        assert!(convert_to_rgba(&map, chunk(20, 16, 8), 2, 2).is_none());
+    }
+
+    #[test]
+    fn rejects_unusable_strides_and_corrupted_chunks() {
+        let map = frame(8, 0);
+        assert!(convert_to_rgba(&map, chunk(0, 16, -8), 2, 2).is_none());
+        assert!(convert_to_rgba(&map, chunk(0, 16, 4), 2, 2).is_none());
+        let corrupted = FrameChunk {
+            corrupted: true,
+            ..chunk(0, 16, 8)
+        };
+        assert!(convert_to_rgba(&map, corrupted, 2, 2).is_none());
     }
 }
